@@ -115,8 +115,12 @@ async def maybe_start_telegram(orch: "GatewayOrchestrator") -> "TelegramClient |
         # fallback, and retire it when the client shuts down so the gate stops
         # routing to a dispatcher that is going away. Idempotent: a restart
         # replaces this channel's own hook.
-        register_channel_delivery("telegram", dispatcher.deliver_spawn_approval)
-        client.on_close = lambda: unregister_channel_delivery("telegram")
+        # The hook is bound ONCE and the same object is handed to both calls, so the
+        # close is a compare-and-drop: a restart whose replacement hook already took
+        # the slot is not unregistered by this (older) client's close.
+        delivery_hook = dispatcher.deliver_spawn_approval
+        register_channel_delivery("telegram", delivery_hook)
+        client.on_close = lambda: unregister_channel_delivery("telegram", delivery_hook)
 
         # Prove the token with an authenticated call BEFORE reporting the
         # channel as connected — transport.connect() only schedules the

@@ -34,7 +34,7 @@ import pytest
 
 # Reuse the channel fixtures the existing Telegram suite uses (fake client,
 # fake sessions, dispatcher factory) so this suite exercises the SAME doubles.
-from test_telegram import _dispatcher  # noqa: E402
+from test_telegram import _cfg, _dispatcher, _prime_live  # noqa: E402
 
 from kiro_crew.messaging import spawn_approval_delivery as seam
 from kiro_crew.messaging.link import CHAT_TYPE_FORUM, parse_session_key
@@ -539,3 +539,167 @@ class TestAutoApprovedNeverReachesTheChannel:
         for t in list(mgr._tasks.values()):
             t.cancel()
         await asyncio.sleep(0)
+
+
+# ── (e) the destination is re-authorized at the instant of delivery ─────────
+
+
+class TestTheDestinationIsReauthorizedBeforeTheSend:
+    """A withdrawn destination gets no prompt, and the spawn still falls through.
+
+    The gate holds a spawn for as long as its approval takes, so the authorization
+    that admitted the originating turn says nothing about the moment the prompt is
+    posted: an operator can drop the peer from the allow-list, or the Topic from the
+    forum allow-list, inside that window. The prompt carries a task preview, so the
+    send is re-decided here against the LIVE gates rather than the ones the turn
+    started under. Every arm below asserts the same three things: no send, the armed
+    nonce retired, and ``None`` (fall through) rather than ``False`` — nothing was
+    surfaced, so there is no decision to report.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _short_prompt_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Shrink the deny-by-default wait so a REGRESSION fails fast.
+
+        A refusal here returns before the prompt is ever awaited, so this fixture
+        does not touch the path under test. It bounds the OTHER outcome: code that
+        posts the prompt anyway would park every assertion below on
+        ``_APPROVAL_TIMEOUT_S`` (minutes) and surface as a suite-wide timeout
+        instead of a failed assertion.
+        """
+        import kiro_crew.telegram.renderer as renderer_mod
+
+        monkeypatch.setattr(renderer_mod, "_APPROVAL_TIMEOUT_S", 0.2)
+
+    def test_a_peer_dropped_from_the_roster_gets_no_prompt(self) -> None:
+        d, cli, _sess = _dispatcher({7})
+        session_key = d._session_key(("direct", "7"))
+        # Revocation lands after the turn that asked for the spawn: the applier
+        # pushes a reloaded allow-list at the live dispatcher.
+        d._allowed.clear()
+
+        result = asyncio.run(d.deliver_spawn_approval("spawn:abc", "spawn_run(build)", session_key))
+
+        assert result is None
+        assert cli.sent == []
+        key = TelegramApprovalDecider.key(session_key, "spawn:abc")
+        assert key not in TelegramApprovalDecider._NONCES
+        assert key not in TelegramApprovalDecider._REGISTRY
+
+    def test_a_topic_dropped_from_the_forum_allow_list_gets_no_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chat_id, thread = -1001234567890, 42
+        d, cli, _sess = _dispatcher({7}, allow_forum=True, allowed_forum_chat_ids=[chat_id])
+        session_key = d._session_key((CHAT_TYPE_FORUM, f"{chat_id}:{thread}"))
+        # The Topic's supergroup leaves the forum allow-list mid-window. The gate
+        # reads the config at point of use, which is what makes that observable.
+        revoked = _cfg(allow_forum=True, allowed_forum_chat_ids=[])
+        _prime_live(revoked)
+        monkeypatch.setattr(d, "_live_cfg", lambda: revoked)
+
+        result = asyncio.run(d.deliver_spawn_approval("spawn:abc", "spawn_run(build)", session_key))
+
+        assert result is None
+        assert cli.sent == []
+        key = TelegramApprovalDecider.key(session_key, "spawn:abc")
+        assert key not in TelegramApprovalDecider._NONCES
+
+    def test_a_transport_egress_denial_gets_no_prompt(self) -> None:
+        # The roster still holds the peer, so ONLY the transport's own
+        # revocation-at-egress decision can refuse here.
+        d, cli, _sess = _dispatcher({7})
+        d.transport = SimpleNamespace(may_send_to=lambda _c, _t=None, **_k: False)  # type: ignore[assignment]
+        session_key = d._session_key(("direct", "7"))
+
+        result = asyncio.run(d.deliver_spawn_approval("spawn:abc", "spawn_run(build)", session_key))
+
+        assert result is None
+        assert cli.sent == []
+
+    def test_a_raising_egress_gate_is_read_as_revoked(self) -> None:
+        d, cli, _sess = _dispatcher({7})
+
+        def _boom(_conversation, _thread=None, **_k):  # type: ignore[no-untyped-def]
+            raise RuntimeError("roster store unreadable")
+
+        d.transport = SimpleNamespace(may_send_to=_boom)  # type: ignore[assignment]
+        session_key = d._session_key(("direct", "7"))
+
+        # Fail closed: an unanswerable gate at an egress boundary is a denial.
+        result = asyncio.run(d.deliver_spawn_approval("spawn:abc", "spawn_run(build)", session_key))
+
+        assert result is None
+        assert cli.sent == []
+
+    def test_an_authorized_destination_still_posts_through_the_transport_gate(self) -> None:
+        # The gate is consulted with the destination it will actually send to, and a
+        # grant is not turned into a refusal.
+        d, cli, _sess = _dispatcher({7})
+        seen: list[tuple[str, str | None]] = []
+
+        def _gate(conversation, thread=None, **_k):  # type: ignore[no-untyped-def]
+            seen.append((conversation, thread))
+            return True
+
+        d.transport = SimpleNamespace(may_send_to=_gate)  # type: ignore[assignment]
+        session_key = d._session_key(("direct", "7"))
+
+        async def _go() -> bool | None:
+            task = asyncio.ensure_future(
+                d.deliver_spawn_approval("spawn:abc", "spawn_run(build)", session_key)
+            )
+            await asyncio.sleep(0)
+            await _press(d, session_key, "spawn:abc", "1")
+            return await task
+
+        assert asyncio.run(_go()) is True
+        assert len(cli.sent) == 1
+        assert seen == [("7", None)]
+
+
+class TestAnOverlappingRestartKeepsItsReplacementHook:
+    """A stale close must not unregister the hook that replaced it."""
+
+    def test_a_stale_close_leaves_the_replacement_registered(self) -> None:
+        async def _old(_rid: str, _desc: str, _parent: str) -> bool:
+            return True
+
+        async def _new(_rid: str, _desc: str, _parent: str) -> bool:
+            return False
+
+        seam.register_channel_delivery("telegram", _old)
+        # A restart registers the replacement before the OLD client's close runs.
+        seam.register_channel_delivery("telegram", _new)
+        seam.unregister_channel_delivery("telegram", _old)
+
+        assert seam.resolve_channel_delivery("telegram:k:direct:7") is _new
+
+    def test_the_owning_close_still_drops_its_own_hook(self) -> None:
+        async def _hook(_rid: str, _desc: str, _parent: str) -> bool:
+            return True
+
+        seam.register_channel_delivery("telegram", _hook)
+        seam.unregister_channel_delivery("telegram", _hook)
+
+        assert seam.resolve_channel_delivery("telegram:k:direct:7") is None
+
+    def test_a_bound_method_registration_is_matched_by_equality(self) -> None:
+        # The real caller registers ``dispatcher.deliver_spawn_approval``, and each
+        # attribute access mints a NEW bound-method object — so the comparison has to
+        # be equality, not identity, or a channel could never drop its own hook.
+        d, _cli, _sess = _dispatcher({7})
+        seam.register_channel_delivery("telegram", d.deliver_spawn_approval)
+        seam.unregister_channel_delivery("telegram", d.deliver_spawn_approval)
+
+        assert seam.resolve_channel_delivery("telegram:k:direct:7") is None
+
+    def test_a_close_from_a_different_dispatcher_is_a_no_op(self) -> None:
+        live, _cli, _sess = _dispatcher({7})
+        gone, _cli2, _sess2 = _dispatcher({7})
+        seam.register_channel_delivery("telegram", live.deliver_spawn_approval)
+
+        # The OTHER dispatcher's close: same method, different instance.
+        seam.unregister_channel_delivery("telegram", gone.deliver_spawn_approval)
+
+        assert seam.resolve_channel_delivery("telegram:k:direct:7") == live.deliver_spawn_approval

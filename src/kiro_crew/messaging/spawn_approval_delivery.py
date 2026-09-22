@@ -79,13 +79,32 @@ def register_channel_delivery(channel: str, hook: SpawnApprovalDeliveryHook) -> 
     _HOOKS[channel] = hook
 
 
-def unregister_channel_delivery(channel: str) -> None:
+def unregister_channel_delivery(
+    channel: str, hook: "SpawnApprovalDeliveryHook | None" = None
+) -> None:
     """Drop *channel*'s delivery hook (idempotent).
 
     Called on a channel's shutdown so the gate stops routing to a dispatcher that
     is going away. Absent-key safe: a channel that failed to start never
     registered, and its shutdown path still calls this.
+
+    *hook* is the registration the caller believes it owns, and supplying it makes
+    this a COMPARE-AND-DROP. Two dispatcher lifetimes can overlap: a restart
+    registers the replacement hook (``register_channel_delivery`` replaces the
+    slot) before the OLD client's close callback runs, and an unconditional pop
+    there removes the LIVE replacement — leaving the channel with no delivery
+    surface at all, which the gate reads as "fall through to Slack/dashboard" for
+    every later spawn until the next restart. Comparing first makes a stale close
+    a no-op. Equality rather than identity because the registered hook is a bound
+    method: each ``dispatcher.deliver_spawn_approval`` attribute access mints a new
+    object, and two of them compare equal exactly when they name the same method on
+    the same dispatcher, which is the question being asked here.
+
+    Omitted, the drop stays unconditional for a caller holding no handle on its own
+    registration.
     """
+    if hook is not None and _HOOKS.get(channel) != hook:
+        return
     _HOOKS.pop(channel, None)
 
 

@@ -2944,6 +2944,17 @@ class TelegramDispatcher:
         # here; escape it for the HTML body it lands in.
         detail = " ".join((description or "spawn_run").split())
         body = f"🔐 Approve sub-agent spawn?\n<pre>{html.escape(detail)}</pre>"
+        if not self._spawn_prompt_destination_permitted(chat_id, thread_id):
+            # Authorization for this destination was withdrawn between the turn that
+            # asked for the spawn and this delivery. Retire the armed nonce and fall
+            # through, so the spawn is still answerable on Slack/dashboard.
+            TelegramApprovalDecider.retire(key)
+            logger.info(
+                "Telegram: not posting the spawn-approval prompt for %s; the "
+                "originating conversation is no longer authorized",
+                rid,
+            )
+            return None
         try:
             await client.send_message(
                 chat_id,
@@ -2965,6 +2976,60 @@ class TelegramDispatcher:
         decider = TelegramApprovalDecider(session_key=session_key)
         event = SimpleNamespace(request_id=rid)
         return bool(await decider(event))
+
+    def _spawn_prompt_destination_permitted(self, chat_id: int, thread_id: int | None) -> bool:
+        """May a spawn-approval prompt be posted into this chat RIGHT NOW? Fails closed.
+
+        The gate can hold a spawn for as long as its approval takes, so the
+        authorization that admitted the originating turn is not evidence about this
+        instant: an operator can drop the peer from ``telegram.allowed_user_ids``, or
+        a Topic from the forum allow-list, while the prompt is still being prepared.
+        The prompt carries a task preview, so it is a send that must be re-decided
+        against the LIVE roster rather than the one the turn started under.
+
+        Called SYNCHRONOUSLY with no suspension point between it and the send it
+        gates — an await in between would reopen the window it closes.
+
+        Two authorities, both consulted, neither sufficient alone:
+
+        * the dispatcher's own live gates, which are exactly the ones a PRESS is
+          judged by in ``on_callback`` (``_authorized`` for a DM, whose chat id IS
+          the peer's user id; the shared ``forum_gate_outcome`` predicate for a
+          Topic), so a prompt is never posted where its own button could not be
+          honored;
+        * ``transport.may_send_to``, the transport's revocation-at-egress decision,
+          when a transport is wired. Absent (no transport, as in a unit harness) the
+          dispatcher's gates above stand alone; a raise is read as a denial.
+        """
+        if thread_id is None:
+            # Private chat: its id IS the peer's user id, so the roster answers.
+            if not self._authorized(chat_id):
+                return False
+        else:
+            forum_cfg = self._live_cfg().telegram
+            if (
+                forum_gate_outcome(
+                    "supergroup",
+                    chat_id,
+                    thread_id,
+                    allow_forum=bool(forum_cfg.allow_forum),
+                    allowed_forum_chat_ids=forum_cfg.allowed_forum_chat_ids,
+                )
+                is not None
+            ):
+                return False
+        gate = getattr(self.transport, "may_send_to", None)
+        if gate is None:
+            return True
+        try:
+            return bool(gate(str(chat_id), str(thread_id) if thread_id is not None else None))
+        except Exception:
+            logger.warning(
+                "Telegram: may_send_to raised for the spawn-approval destination; "
+                "treating it as revoked",
+                exc_info=True,
+            )
+            return False
 
     def _spawn_chat_target(self, parent_session_key: str) -> tuple[int, int | None, str] | None:
         """``(chat_id, thread_id, session_key)`` for a Telegram spawn parent, else None.
